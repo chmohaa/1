@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+from html import escape
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -25,7 +26,13 @@ from apscheduler.triggers.cron import CronTrigger
 from zoneinfo import ZoneInfo
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
-ALLOWED_PRIVATE_USER_IDS = {7328877863, 8024893515, 6484875134}
+DEFAULT_ALLOWED_USERS = "7328877863,8024893515,6484875134"
+ALLOWED_PRIVATE_USER_IDS = {
+    int(x.strip())
+    for x in os.getenv("ALLOWED_USER_IDS", DEFAULT_ALLOWED_USERS).split(",")
+    if x.strip()
+}
+ALERT_CHAT_ID = int(os.getenv("ALERT_CHAT_ID", str(min(ALLOWED_PRIVATE_USER_IDS))))
 
 
 @dataclass
@@ -202,12 +209,51 @@ def is_allowed_private_user(message: Message) -> bool:
     return bool(message.from_user and message.from_user.id in ALLOWED_PRIVATE_USER_IDS)
 
 
+async def notify_unauthorized_attempt(bot: Bot, user_id: int | None, username: str | None, full_name: str | None, chat_id: int, chat_type: str, text: str) -> None:
+    safe_text = escape((text or "").strip())
+    safe_text = safe_text[:800] if safe_text else "(empty)"
+    safe_username = escape(username or "-")
+    safe_name = escape(full_name or "-")
+    msg = (
+        "🚨 Неавторизованная попытка команды\n"
+        f"user_id: <code>{user_id}</code>\n"
+        f"username: @{safe_username}\n"
+        f"name: {safe_name}\n"
+        f"chat_id: <code>{chat_id}</code>\n"
+        f"chat_type: <code>{chat_type}</code>\n"
+        f"text: <code>{safe_text}</code>"
+    )
+    try:
+        await bot.send_message(ALERT_CHAT_ID, msg)
+    except Exception:
+        logging.exception("Failed to send unauthorized alert")
+
+
 async def ensure_private_access(message: Message) -> bool:
     if not is_private_chat(message):
         await message.answer("В чате доступна только команда /ping и /help.")
+        if message.from_user and message.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
+            await notify_unauthorized_attempt(
+                message.bot,
+                message.from_user.id,
+                message.from_user.username,
+                message.from_user.full_name,
+                message.chat.id,
+                message.chat.type,
+                message.text or "",
+            )
         return False
     if not is_allowed_private_user(message):
         await message.answer("⛔ У вас нет доступа к этому боту.")
+        await notify_unauthorized_attempt(
+            message.bot,
+            message.from_user.id if message.from_user else None,
+            message.from_user.username if message.from_user else None,
+            message.from_user.full_name if message.from_user else None,
+            message.chat.id,
+            message.chat.type,
+            message.text or "",
+        )
         return False
     return True
 
@@ -427,6 +473,15 @@ async def show_all_servers(message: Message, config: Config) -> None:
 async def callback_show_server(callback: CallbackQuery, config: Config) -> None:
     if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
         await callback.answer("Недоступно в этом чате", show_alert=True)
+        await notify_unauthorized_attempt(
+            callback.bot,
+            callback.from_user.id if callback.from_user else None,
+            callback.from_user.username if callback.from_user else None,
+            callback.from_user.full_name if callback.from_user else None,
+            callback.message.chat.id,
+            callback.message.chat.type,
+            callback.data or "",
+        )
         return
 
     server_id = int(callback.data.split(":", 1)[1])
@@ -548,6 +603,15 @@ async def cmd_balance(message: Message, config: Config) -> None:
 async def callback_paid(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
         await callback.answer("Недоступно", show_alert=True)
+        await notify_unauthorized_attempt(
+            callback.bot,
+            callback.from_user.id if callback.from_user else None,
+            callback.from_user.username if callback.from_user else None,
+            callback.from_user.full_name if callback.from_user else None,
+            callback.message.chat.id,
+            callback.message.chat.type,
+            callback.data or "",
+        )
         return
     server_id = int(callback.data.split(":", 1)[1])
     await state.set_state(PaidDateState.waiting_date)
@@ -603,6 +667,15 @@ async def save_paid_date(message: Message, state: FSMContext, config: Config) ->
 async def callback_adjust_balance(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
         await callback.answer("Недоступно", show_alert=True)
+        await notify_unauthorized_attempt(
+            callback.bot,
+            callback.from_user.id if callback.from_user else None,
+            callback.from_user.username if callback.from_user else None,
+            callback.from_user.full_name if callback.from_user else None,
+            callback.message.chat.id,
+            callback.message.chat.type,
+            callback.data or "",
+        )
         return
     await state.set_state(BalanceAdjustState.waiting_amount)
     await callback.message.answer("Введите сумму в формате +100 или -100")
@@ -635,6 +708,15 @@ async def apply_balance_adjust(message: Message, state: FSMContext, config: Conf
 async def callbacks_router(callback: CallbackQuery, config: Config, state: FSMContext) -> None:
     if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
         await callback.answer("Недоступно", show_alert=True)
+        await notify_unauthorized_attempt(
+            callback.bot,
+            callback.from_user.id if callback.from_user else None,
+            callback.from_user.username if callback.from_user else None,
+            callback.from_user.full_name if callback.from_user else None,
+            callback.message.chat.id,
+            callback.message.chat.type,
+            callback.data or "",
+        )
         return
 
     if callback.data == "show_help":
@@ -692,6 +774,15 @@ async def send_reminders(bot: Bot, config: Config) -> None:
 async def cmd_ping(message: Message, config: Config) -> None:
     if is_private_chat(message) and not is_allowed_private_user(message):
         await message.answer("⛔ У вас нет доступа к этому боту.")
+        await notify_unauthorized_attempt(
+            message.bot,
+            message.from_user.id if message.from_user else None,
+            message.from_user.username if message.from_user else None,
+            message.from_user.full_name if message.from_user else None,
+            message.chat.id,
+            message.chat.type,
+            message.text or "",
+        )
         return
 
     with closing(db_connect(config.db_path)) as conn:
@@ -713,6 +804,15 @@ async def cmd_ping(message: Message, config: Config) -> None:
 async def callback_ping_server(callback: CallbackQuery, config: Config) -> None:
     if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
         await callback.answer("Недоступно", show_alert=True)
+        await notify_unauthorized_attempt(
+            callback.bot,
+            callback.from_user.id if callback.from_user else None,
+            callback.from_user.username if callback.from_user else None,
+            callback.from_user.full_name if callback.from_user else None,
+            callback.message.chat.id,
+            callback.message.chat.type,
+            callback.data or "",
+        )
         return
 
     server_id = int(callback.data.split(":", 1)[1])
