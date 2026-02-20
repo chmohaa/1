@@ -25,6 +25,7 @@ from apscheduler.triggers.cron import CronTrigger
 from zoneinfo import ZoneInfo
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+ALLOWED_PRIVATE_USER_IDS = {7328877863, 8024893515, 6484875134}
 
 
 @dataclass
@@ -161,6 +162,7 @@ def reminder_kb(server_id: int, provider_url: str) -> InlineKeyboardMarkup:
 def server_credentials_keyboard(server: sqlite3.Row, provider: sqlite3.Row) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="🏓 Пинг", callback_data=f"ping:{server['id']}")],
             [InlineKeyboardButton(text="📋 Copy user", copy_text=CopyTextButton(text=server["ssh_user"]))],
             [InlineKeyboardButton(text="📋 Copy passwd", copy_text=CopyTextButton(text=server["ssh_password"]))],
             [InlineKeyboardButton(text="📋 Copy acc user", copy_text=CopyTextButton(text=provider["acc_user"]))],
@@ -192,7 +194,51 @@ def add_transaction(conn: sqlite3.Connection, amount: float, description: str) -
     )
 
 
+def is_private_chat(message: Message) -> bool:
+    return message.chat.type == "private"
+
+
+def is_allowed_private_user(message: Message) -> bool:
+    return bool(message.from_user and message.from_user.id in ALLOWED_PRIVATE_USER_IDS)
+
+
+async def ensure_private_access(message: Message) -> bool:
+    if not is_private_chat(message):
+        await message.answer("В чате доступна только команда /ping и /help.")
+        return False
+    if not is_allowed_private_user(message):
+        await message.answer("⛔ У вас нет доступа к этому боту.")
+        return False
+    return True
+
+
+async def ping_ip(ip: str) -> tuple[bool, str]:
+    proc = await asyncio.create_subprocess_exec(
+        "ping",
+        "-c",
+        "4",
+        ip,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+    except TimeoutError:
+        proc.kill()
+        return False, "timeout"
+
+    output = stdout.decode("utf-8", errors="ignore").strip()
+    err = stderr.decode("utf-8", errors="ignore").strip()
+    if proc.returncode == 0:
+        summary = output.splitlines()[-2:] if output else ["ok"]
+        return True, " | ".join(summary)
+    return False, (err or output or "unreachable")
+
+
 async def cmd_start(message: Message, config: Config) -> None:
+    if not await ensure_private_access(message):
+        return
+
     with closing(db_connect(config.db_path)) as conn:
         conn.execute(
             "INSERT INTO settings(key, value) VALUES('chat_id', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -211,6 +257,13 @@ async def cmd_start(message: Message, config: Config) -> None:
 
 
 async def cmd_help(message: Message) -> None:
+    if not is_private_chat(message):
+        await message.answer("Этот бот в чате умеет только команду /ping (проверка серверов).")
+        return
+    if not is_allowed_private_user(message):
+        await message.answer("⛔ У вас нет доступа к этому боту.")
+        return
+
     await message.answer(
         """
 Доступные команды:
@@ -228,11 +281,16 @@ async def cmd_help(message: Message) -> None:
 
 
 async def cmd_add_provider(message: Message, state: FSMContext) -> None:
+    if not await ensure_private_access(message):
+        return
     await state.set_state(AddProviderStates.name)
     await message.answer("Введите название провайдера:")
 
 
 async def provider_flow(message: Message, state: FSMContext, config: Config) -> None:
+    if not await ensure_private_access(message):
+        await state.clear()
+        return
     current = await state.get_state()
     if current == AddProviderStates.name.state:
         await state.update_data(name=message.text.strip())
@@ -267,11 +325,16 @@ async def provider_flow(message: Message, state: FSMContext, config: Config) -> 
 
 
 async def cmd_add_server(message: Message, state: FSMContext) -> None:
+    if not await ensure_private_access(message):
+        return
     await state.set_state(AddServerStates.name)
     await message.answer("Название сервера:")
 
 
 async def server_flow(message: Message, state: FSMContext, config: Config) -> None:
+    if not await ensure_private_access(message):
+        await state.clear()
+        return
     current = await state.get_state()
     if current == AddServerStates.name.state:
         await state.update_data(name=message.text.strip())
@@ -341,6 +404,8 @@ async def server_flow(message: Message, state: FSMContext, config: Config) -> No
 
 
 async def show_all_servers(message: Message, config: Config) -> None:
+    if not await ensure_private_access(message):
+        return
     with closing(db_connect(config.db_path)) as conn:
         rows = conn.execute("SELECT id, name, due_date FROM servers ORDER BY due_date").fetchall()
     if not rows:
@@ -360,6 +425,10 @@ async def show_all_servers(message: Message, config: Config) -> None:
 
 
 async def callback_show_server(callback: CallbackQuery, config: Config) -> None:
+    if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
+        await callback.answer("Недоступно в этом чате", show_alert=True)
+        return
+
     server_id = int(callback.data.split(":", 1)[1])
     with closing(db_connect(config.db_path)) as conn:
         server = conn.execute("SELECT * FROM servers WHERE id=?", (server_id,)).fetchone()
@@ -385,6 +454,8 @@ async def callback_show_server(callback: CallbackQuery, config: Config) -> None:
 
 
 async def server_info_alias(message: Message, config: Config) -> None:
+    if not await ensure_private_access(message):
+        return
     if not message.text.startswith("/server-info-"):
         return
     name = message.text.replace("/server-info-", "", 1).strip()
@@ -406,6 +477,8 @@ async def server_info_alias(message: Message, config: Config) -> None:
 
 
 async def show_upcoming(message: Message, config: Config) -> None:
+    if not await ensure_private_access(message):
+        return
     now = datetime.now(MOSCOW_TZ).date()
     week_end = now + timedelta(days=7)
     with closing(db_connect(config.db_path)) as conn:
@@ -431,6 +504,8 @@ async def show_upcoming(message: Message, config: Config) -> None:
 
 
 async def cmd_total(message: Message, config: Config) -> None:
+    if not await ensure_private_access(message):
+        return
     with closing(db_connect(config.db_path)) as conn:
         per_server = conn.execute(
             """
@@ -450,6 +525,8 @@ async def cmd_total(message: Message, config: Config) -> None:
 
 
 async def cmd_balance(message: Message, config: Config) -> None:
+    if not await ensure_private_access(message):
+        return
     with closing(db_connect(config.db_path)) as conn:
         bal = get_balance(conn)
         rows = conn.execute(
@@ -469,6 +546,9 @@ async def cmd_balance(message: Message, config: Config) -> None:
 
 
 async def callback_paid(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
+        await callback.answer("Недоступно", show_alert=True)
+        return
     server_id = int(callback.data.split(":", 1)[1])
     await state.set_state(PaidDateState.waiting_date)
     await state.update_data(paid_server_id=server_id)
@@ -477,6 +557,9 @@ async def callback_paid(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 async def save_paid_date(message: Message, state: FSMContext, config: Config) -> None:
+    if not await ensure_private_access(message):
+        await state.clear()
+        return
     data = await state.get_data()
     server_id = data.get("paid_server_id")
     if not server_id:
@@ -518,12 +601,18 @@ async def save_paid_date(message: Message, state: FSMContext, config: Config) ->
 
 
 async def callback_adjust_balance(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
+        await callback.answer("Недоступно", show_alert=True)
+        return
     await state.set_state(BalanceAdjustState.waiting_amount)
     await callback.message.answer("Введите сумму в формате +100 или -100")
     await callback.answer()
 
 
 async def apply_balance_adjust(message: Message, state: FSMContext, config: Config) -> None:
+    if not await ensure_private_access(message):
+        await state.clear()
+        return
     raw = message.text.strip().replace(" ", "")
     if not (raw.startswith("+") or raw.startswith("-")):
         await message.answer("Формат должен быть +100 или -100")
@@ -544,6 +633,10 @@ async def apply_balance_adjust(message: Message, state: FSMContext, config: Conf
 
 
 async def callbacks_router(callback: CallbackQuery, config: Config, state: FSMContext) -> None:
+    if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+
     if callback.data == "show_help":
         await cmd_help(callback.message)
         await callback.answer()
@@ -566,7 +659,9 @@ async def send_reminders(bot: Bot, config: Config) -> None:
         # Последний пользователь, который написал /start
         row = conn.execute("SELECT value FROM settings WHERE key='chat_id'").fetchone()
         if row:
-            users = [int(row["value"])]
+            chat_id = int(row["value"])
+            if chat_id in ALLOWED_PRIVATE_USER_IDS:
+                users = [chat_id]
         servers = conn.execute(
             """
             SELECT s.id, s.name, s.ip, s.price, s.due_date, p.site_url
@@ -594,6 +689,48 @@ async def send_reminders(bot: Bot, config: Config) -> None:
             await bot.send_message(chat_id, text, reply_markup=reminder_kb(s["id"], s["site_url"]))
 
 
+async def cmd_ping(message: Message, config: Config) -> None:
+    if is_private_chat(message) and not is_allowed_private_user(message):
+        await message.answer("⛔ У вас нет доступа к этому боту.")
+        return
+
+    with closing(db_connect(config.db_path)) as conn:
+        servers = conn.execute("SELECT id, name, ip FROM servers ORDER BY name").fetchall()
+
+    if not servers:
+        await message.answer("Серверов пока нет.")
+        return
+
+    await message.answer("Проверяю пинг серверов (ping -c 4)...")
+    lines = ["Результат /ping:"]
+    for srv in servers:
+        ok, details = await ping_ip(srv["ip"])
+        status = "✅" if ok else "❌"
+        lines.append(f"{status} {srv['name']} ({srv['ip']}) — <code>{details}</code>")
+    await message.answer("\n".join(lines))
+
+
+async def callback_ping_server(callback: CallbackQuery, config: Config) -> None:
+    if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+
+    server_id = int(callback.data.split(":", 1)[1])
+    with closing(db_connect(config.db_path)) as conn:
+        server = conn.execute("SELECT name, ip FROM servers WHERE id=?", (server_id,)).fetchone()
+
+    if not server:
+        await callback.answer("Сервер не найден", show_alert=True)
+        return
+
+    await callback.answer("Пингую...")
+    ok, details = await ping_ip(server["ip"])
+    status = "✅" if ok else "❌"
+    await callback.message.answer(
+        f"{status} Пинг {server['name']} ({server['ip']}):\n<code>{details}</code>"
+    )
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     config = get_config()
@@ -604,6 +741,7 @@ async def main() -> None:
 
     dp.message.register(cmd_start, CommandStart(), flags={"config": config})
     dp.message.register(cmd_help, Command("help"))
+    dp.message.register(cmd_ping, Command("ping"), flags={"config": config})
     dp.message.register(cmd_add_provider, Command("add_provider"))
     dp.message.register(cmd_add_server, Command("add_new_server"))
     dp.message.register(show_all_servers, Command("all"), flags={"config": config})
@@ -613,6 +751,7 @@ async def main() -> None:
     dp.message.register(server_info_alias, F.text.startswith("/server-info-"), flags={"config": config})
 
     dp.callback_query.register(callback_show_server, F.data.startswith("server:"), flags={"config": config})
+    dp.callback_query.register(callback_ping_server, F.data.startswith("ping:"), flags={"config": config})
     dp.callback_query.register(callback_paid, F.data.startswith("paid:"))
     dp.callback_query.register(callback_adjust_balance, F.data == "adjust_balance")
     dp.callback_query.register(callbacks_router, flags={"config": config})
