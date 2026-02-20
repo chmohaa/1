@@ -227,11 +227,11 @@ async def notify_unauthorized_attempt(bot: Bot, user_id: int | None, username: s
         f"chat_type: <code>{chat_type}</code>\n"
         f"text: <code>{safe_text}</code>"
     )
-    try:
-        for alert_chat_id in ALERT_CHAT_IDS:
+    for alert_chat_id in ALERT_CHAT_IDS:
+        try:
             await bot.send_message(alert_chat_id, msg)
-    except Exception:
-        logging.exception("Failed to send unauthorized alert")
+        except Exception:
+            logging.exception("Failed to send unauthorized alert to %s", alert_chat_id)
 
 
 async def ensure_private_access(message: Message) -> bool:
@@ -307,12 +307,21 @@ async def cmd_start(message: Message, config: Config) -> None:
     await message.answer(text, reply_markup=main_menu_kb())
 
 
-async def cmd_help(message: Message) -> None:
+async def cmd_help(message: Message, check_access: bool = True) -> None:
     if not is_private_chat(message):
         await message.answer("Этот бот в чате умеет только команду /ping (проверка серверов).")
         return
-    if not is_allowed_private_user(message):
+    if check_access and not is_allowed_private_user(message):
         await message.answer("⛔ У вас нет доступа к этому боту.")
+        await notify_unauthorized_attempt(
+            message.bot,
+            message.from_user.id if message.from_user else None,
+            message.from_user.username if message.from_user else None,
+            message.from_user.full_name if message.from_user else None,
+            message.chat.id,
+            message.chat.type,
+            message.text or "",
+        )
         return
 
     await message.answer(
@@ -454,8 +463,8 @@ async def server_flow(message: Message, state: FSMContext, config: Config) -> No
         await state.clear()
 
 
-async def show_all_servers(message: Message, config: Config) -> None:
-    if not await ensure_private_access(message):
+async def show_all_servers(message: Message, config: Config, check_access: bool = True) -> None:
+    if check_access and not await ensure_private_access(message):
         return
     with closing(db_connect(config.db_path)) as conn:
         rows = conn.execute("SELECT id, name, due_date FROM servers ORDER BY due_date").fetchall()
@@ -536,8 +545,8 @@ async def server_info_alias(message: Message, config: Config) -> None:
     )
 
 
-async def show_upcoming(message: Message, config: Config) -> None:
-    if not await ensure_private_access(message):
+async def show_upcoming(message: Message, config: Config, check_access: bool = True) -> None:
+    if check_access and not await ensure_private_access(message):
         return
     now = datetime.now(MOSCOW_TZ).date()
     week_end = now + timedelta(days=7)
@@ -584,8 +593,8 @@ async def cmd_total(message: Message, config: Config) -> None:
     await message.answer("\n".join(lines))
 
 
-async def cmd_balance(message: Message, config: Config) -> None:
-    if not await ensure_private_access(message):
+async def cmd_balance(message: Message, config: Config, check_access: bool = True) -> None:
+    if check_access and not await ensure_private_access(message):
         return
     with closing(db_connect(config.db_path)) as conn:
         bal = get_balance(conn)
@@ -725,16 +734,16 @@ async def callbacks_router(callback: CallbackQuery, config: Config, state: FSMCo
         return
 
     if callback.data == "show_help":
-        await cmd_help(callback.message)
+        await cmd_help(callback.message, check_access=False)
         await callback.answer()
     elif callback.data == "show_all_servers":
-        await show_all_servers(callback.message, config)
+        await show_all_servers(callback.message, config, check_access=False)
         await callback.answer()
     elif callback.data == "show_upcoming":
-        await show_upcoming(callback.message, config)
+        await show_upcoming(callback.message, config, check_access=False)
         await callback.answer()
     elif callback.data == "open_balance":
-        await cmd_balance(callback.message, config)
+        await cmd_balance(callback.message, config, check_access=False)
         await callback.answer()
 
 
