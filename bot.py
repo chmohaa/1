@@ -16,7 +16,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
-    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -155,6 +154,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="💰 Пополнить/списать баланс", callback_data="open_balance")],
             [InlineKeyboardButton(text="🗂 Лист всех серверов", callback_data="show_all_servers")],
+            [InlineKeyboardButton(text="🏢 Лист провайдеров", callback_data="show_providers")],
             [InlineKeyboardButton(text="📅 Предстоящие оплаты", callback_data="show_upcoming")],
             [InlineKeyboardButton(text="❓ Помощь", callback_data="show_help")],
         ]
@@ -174,10 +174,6 @@ def server_credentials_keyboard(server: sqlite3.Row, provider: sqlite3.Row) -> I
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🏓 Пинг", callback_data=f"ping:{server['id']}")],
-            [InlineKeyboardButton(text="📋 Copy user", copy_text=CopyTextButton(text=server["ssh_user"]))],
-            [InlineKeyboardButton(text="📋 Copy passwd", copy_text=CopyTextButton(text=server["ssh_password"]))],
-            [InlineKeyboardButton(text="📋 Copy acc user", copy_text=CopyTextButton(text=provider["acc_user"]))],
-            [InlineKeyboardButton(text="📋 Copy acc passwd", copy_text=CopyTextButton(text=provider["acc_password"]))],
             [InlineKeyboardButton(text="🌐 Сайт провайдера", url=provider["site_url"])],
         ]
     )
@@ -302,7 +298,7 @@ async def cmd_start(message: Message, config: Config) -> None:
         f"Панель управления: {config.panel_url}\n"
         f"Логин: <code>{config.panel_login}</code>\n"
         f"Пароль: <code>{config.panel_password}</code>\n\n"
-        "Быстрые команды: /all, /upcoming, /balance, /add_provider, /add_new_server, /help"
+        "Быстрые команды: /all, /providers, /upcoming, /balance, /add_provider, /add_new_server, /delete_server, /delete_provider, /help"
     )
     await message.answer(text, reply_markup=main_menu_kb())
 
@@ -331,6 +327,9 @@ async def cmd_help(message: Message, check_access: bool = True) -> None:
 /help — справка.
 /add_provider — добавить провайдера.
 /add_new_server — добавить сервер.
+/providers — список провайдеров.
+/delete_provider — удалить провайдера.
+/delete_server — удалить сервер.
 /all — список всех серверов.
 /upcoming — оплаты на этой неделе.
 /total — сумма расходов по серверам и общая.
@@ -412,6 +411,16 @@ async def server_flow(message: Message, state: FSMContext, config: Config) -> No
         await state.update_data(ssh_password=message.text.strip())
         await state.set_state(AddServerStates.provider_name)
         await message.answer("Название провайдера (должен быть добавлен через /add_provider):")
+        with closing(db_connect(config.db_path)) as conn:
+            providers = conn.execute("SELECT id, name FROM providers ORDER BY name").fetchall()
+        if providers:
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text=p["name"], callback_data=f"choose_provider:{p['id']}")]
+                    for p in providers
+                ]
+            )
+            await message.answer("Выбери провайдера из списка кнопками:", reply_markup=kb)
     elif current == AddServerStates.provider_name.state:
         await state.update_data(provider_name=message.text.strip())
         await state.set_state(AddServerStates.price)
@@ -484,6 +493,61 @@ async def show_all_servers(message: Message, config: Config, check_access: bool 
     await message.answer("Список серверов. Для добавления: /add_new_server", reply_markup=kb)
 
 
+async def show_providers(message: Message, config: Config, check_access: bool = True) -> None:
+    if check_access and not await ensure_private_access(message):
+        return
+    with closing(db_connect(config.db_path)) as conn:
+        rows = conn.execute("SELECT id, name FROM providers ORDER BY name").fetchall()
+    if not rows:
+        await message.answer("Провайдеров пока нет. Используй /add_provider")
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=r["name"], callback_data=f"provider:{r['id']}")]
+            for r in rows
+        ]
+    )
+    await message.answer("Список провайдеров:", reply_markup=kb)
+
+
+async def cmd_providers(message: Message, config: Config) -> None:
+    await show_providers(message, config, check_access=True)
+
+
+async def cmd_delete_server(message: Message, config: Config) -> None:
+    if not await ensure_private_access(message):
+        return
+    with closing(db_connect(config.db_path)) as conn:
+        rows = conn.execute("SELECT id, name FROM servers ORDER BY name").fetchall()
+    if not rows:
+        await message.answer("Удалять нечего: серверов нет")
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"🗑 {r['name']}", callback_data=f"delete_server:{r['id']}")]
+            for r in rows
+        ]
+    )
+    await message.answer("Выберите сервер для удаления:", reply_markup=kb)
+
+
+async def cmd_delete_provider(message: Message, config: Config) -> None:
+    if not await ensure_private_access(message):
+        return
+    with closing(db_connect(config.db_path)) as conn:
+        rows = conn.execute("SELECT id, name FROM providers ORDER BY name").fetchall()
+    if not rows:
+        await message.answer("Удалять нечего: провайдеров нет")
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"🗑 {r['name']}", callback_data=f"delete_provider:{r['id']}")]
+            for r in rows
+        ]
+    )
+    await message.answer("Выберите провайдера для удаления:", reply_markup=kb)
+
+
 async def callback_show_server(callback: CallbackQuery, config: Config) -> None:
     if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
         await callback.answer("Недоступно в этом чате", show_alert=True)
@@ -519,6 +583,106 @@ async def callback_show_server(callback: CallbackQuery, config: Config) -> None:
         f"Дата окончания: {server['due_date']}"
     )
     await callback.message.answer(text, reply_markup=server_credentials_keyboard(server, provider))
+    await callback.answer()
+
+
+async def callback_show_provider(callback: CallbackQuery, config: Config) -> None:
+    if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
+        await callback.answer("Недоступно", show_alert=True)
+        await notify_unauthorized_attempt(
+            callback.bot,
+            callback.from_user.id if callback.from_user else None,
+            callback.from_user.username if callback.from_user else None,
+            callback.from_user.full_name if callback.from_user else None,
+            callback.message.chat.id,
+            callback.message.chat.type,
+            callback.data or "",
+        )
+        return
+
+    provider_id = int(callback.data.split(":", 1)[1])
+    with closing(db_connect(config.db_path)) as conn:
+        provider = conn.execute("SELECT id, name FROM providers WHERE id=?", (provider_id,)).fetchone()
+        if not provider:
+            await callback.answer("Провайдер не найден", show_alert=True)
+            return
+        servers = conn.execute(
+            "SELECT id, name, due_date FROM servers WHERE provider_id=? ORDER BY due_date",
+            (provider_id,),
+        ).fetchall()
+
+    if not servers:
+        await callback.message.answer(f"У провайдера {provider['name']} пока нет серверов")
+        await callback.answer()
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"{s['name']} — до {s['due_date']}", callback_data=f"server:{s['id']}"
+                )
+            ]
+            for s in servers
+        ]
+    )
+    await callback.message.answer(f"Сервера провайдера {provider['name']}:", reply_markup=kb)
+    await callback.answer()
+
+
+async def callback_delete_server(callback: CallbackQuery, config: Config) -> None:
+    if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+
+    server_id = int(callback.data.split(":", 1)[1])
+    with closing(db_connect(config.db_path)) as conn:
+        row = conn.execute("SELECT name FROM servers WHERE id=?", (server_id,)).fetchone()
+        if not row:
+            await callback.answer("Сервер не найден", show_alert=True)
+            return
+        conn.execute("DELETE FROM payments WHERE server_id=?", (server_id,))
+        conn.execute("DELETE FROM servers WHERE id=?", (server_id,))
+        conn.commit()
+    await callback.message.answer(f"Сервер {row['name']} удален ✅")
+    await callback.answer()
+
+
+async def callback_delete_provider(callback: CallbackQuery, config: Config) -> None:
+    if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+
+    provider_id = int(callback.data.split(":", 1)[1])
+    with closing(db_connect(config.db_path)) as conn:
+        provider = conn.execute("SELECT name FROM providers WHERE id=?", (provider_id,)).fetchone()
+        if not provider:
+            await callback.answer("Провайдер не найден", show_alert=True)
+            return
+        linked = conn.execute("SELECT COUNT(*) AS c FROM servers WHERE provider_id=?", (provider_id,)).fetchone()["c"]
+        if linked > 0:
+            await callback.message.answer("Нельзя удалить провайдера: сначала удалите или перенесите его серверы")
+            await callback.answer()
+            return
+        conn.execute("DELETE FROM providers WHERE id=?", (provider_id,))
+        conn.commit()
+    await callback.message.answer(f"Провайдер {provider['name']} удален ✅")
+    await callback.answer()
+
+
+async def callback_choose_provider(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
+    if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    provider_id = int(callback.data.split(":", 1)[1])
+    with closing(db_connect(config.db_path)) as conn:
+        provider = conn.execute("SELECT name FROM providers WHERE id=?", (provider_id,)).fetchone()
+    if not provider:
+        await callback.answer("Провайдер не найден", show_alert=True)
+        return
+    await state.update_data(provider_name=provider["name"])
+    await state.set_state(AddServerStates.price)
+    await callback.message.answer("Сколько нужно оплачивать (в рублях, например 1200):")
     await callback.answer()
 
 
@@ -739,6 +903,9 @@ async def callbacks_router(callback: CallbackQuery, config: Config, state: FSMCo
     elif callback.data == "show_all_servers":
         await show_all_servers(callback.message, config, check_access=False)
         await callback.answer()
+    elif callback.data == "show_providers":
+        await show_providers(callback.message, config, check_access=False)
+        await callback.answer()
     elif callback.data == "show_upcoming":
         await show_upcoming(callback.message, config, check_access=False)
         await callback.answer()
@@ -858,6 +1025,9 @@ async def main() -> None:
     dp.message.register(cmd_ping, Command("ping"), flags={"config": config})
     dp.message.register(cmd_add_provider, Command("add_provider"))
     dp.message.register(cmd_add_server, Command("add_new_server"))
+    dp.message.register(cmd_providers, Command("providers"), flags={"config": config})
+    dp.message.register(cmd_delete_provider, Command("delete_provider"), flags={"config": config})
+    dp.message.register(cmd_delete_server, Command("delete_server"), flags={"config": config})
     dp.message.register(show_all_servers, Command("all"), flags={"config": config})
     dp.message.register(show_upcoming, Command("upcoming"), flags={"config": config})
     dp.message.register(cmd_total, Command("total"), flags={"config": config})
@@ -865,6 +1035,10 @@ async def main() -> None:
     dp.message.register(server_info_alias, F.text.startswith("/server-info-"), flags={"config": config})
 
     dp.callback_query.register(callback_show_server, F.data.startswith("server:"), flags={"config": config})
+    dp.callback_query.register(callback_show_provider, F.data.startswith("provider:"), flags={"config": config})
+    dp.callback_query.register(callback_delete_provider, F.data.startswith("delete_provider:"), flags={"config": config})
+    dp.callback_query.register(callback_delete_server, F.data.startswith("delete_server:"), flags={"config": config})
+    dp.callback_query.register(callback_choose_provider, F.data.startswith("choose_provider:"), flags={"config": config})
     dp.callback_query.register(callback_ping_server, F.data.startswith("ping:"), flags={"config": config})
     dp.callback_query.register(callback_paid, F.data.startswith("paid:"))
     dp.callback_query.register(callback_adjust_balance, F.data == "adjust_balance")
