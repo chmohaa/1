@@ -305,7 +305,11 @@ async def cmd_start(message: Message, config: Config) -> None:
 
 async def cmd_help(message: Message, check_access: bool = True) -> None:
     if not is_private_chat(message):
-        await message.answer("Этот бот в чате умеет только команду /ping (проверка серверов).")
+        await message.answer(
+            "Этот бот в чате умеет:\n"
+            "/ping — пинг всех серверов\n"
+            "/ping_название_сервера — пинг конкретного сервера"
+        )
         return
     if check_access and not is_allowed_private_user(message):
         await message.answer("⛔ У вас нет доступа к этому боту.")
@@ -982,6 +986,56 @@ async def cmd_ping(message: Message, config: Config) -> None:
     await message.answer("\n".join(lines))
 
 
+async def cmd_ping_single(message: Message, config: Config) -> None:
+    text = (message.text or "").strip()
+    if not text.startswith("/ping_"):
+        return
+
+    raw = text[6:]
+    if "@" in raw:
+        raw = raw.split("@", 1)[0]
+    server_token = raw.strip()
+    if not server_token:
+        await message.answer("Укажи сервер: /ping_название_сервера")
+        return
+
+    if is_private_chat(message) and not is_allowed_private_user(message):
+        await message.answer("⛔ У вас нет доступа к этому боту.")
+        await notify_unauthorized_attempt(
+            message.bot,
+            message.from_user.id if message.from_user else None,
+            message.from_user.username if message.from_user else None,
+            message.from_user.full_name if message.from_user else None,
+            message.chat.id,
+            message.chat.type,
+            message.text or "",
+        )
+        return
+
+    normalized = server_token.replace("_", " ")
+    with closing(db_connect(config.db_path)) as conn:
+        server = conn.execute(
+            """
+            SELECT id, name, ip
+            FROM servers
+            WHERE name = ? OR name = ? OR REPLACE(name, ' ', '_') = ?
+            LIMIT 1
+            """,
+            (server_token, normalized, server_token),
+        ).fetchone()
+
+    if not server:
+        await message.answer(f"Сервер не найден: <code>{server_token}</code>")
+        return
+
+    await message.answer(f"Пингую {server['name']} (ping -c 4)...")
+    ok, details = await ping_ip(server["ip"])
+    status = "✅" if ok else "❌"
+    await message.answer(
+        f"{status} Пинг {server['name']} ({server['ip']}):\n<code>{details}</code>"
+    )
+
+
 async def callback_ping_server(callback: CallbackQuery, config: Config) -> None:
     if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
         await callback.answer("Недоступно", show_alert=True)
@@ -1023,6 +1077,7 @@ async def main() -> None:
     dp.message.register(cmd_start, CommandStart(), flags={"config": config})
     dp.message.register(cmd_help, Command("help"))
     dp.message.register(cmd_ping, Command("ping"), flags={"config": config})
+    dp.message.register(cmd_ping_single, F.text.startswith("/ping_"), flags={"config": config})
     dp.message.register(cmd_add_provider, Command("add_provider"))
     dp.message.register(cmd_add_server, Command("add_new_server"))
     dp.message.register(cmd_providers, Command("providers"), flags={"config": config})
