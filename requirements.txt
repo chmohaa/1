@@ -1,0 +1,2 @@
+aiogram>=3.7.0
+APScheduler>=3.10.4
