@@ -193,6 +193,13 @@ def add_transaction(conn: sqlite3.Connection, amount: float, description: str) -
 
 
 async def cmd_start(message: Message, config: Config) -> None:
+    with closing(db_connect(config.db_path)) as conn:
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('chat_id', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(message.chat.id),),
+        )
+        conn.commit()
+
     text = (
         "Привет! Я помогу контролировать оплаты серверов.\n\n"
         f"Панель управления: {config.panel_url}\n"
@@ -215,7 +222,7 @@ async def cmd_help(message: Message) -> None:
 /upcoming — оплаты на этой неделе.
 /total — сумма расходов по серверам и общая.
 /balance — текущий баланс и 3 последних расхода.
-/server-info-<название> — показать полный доступ к серверу.
+/server-info-&lt;название&gt; — показать полный доступ к серверу.
         """.strip()
     )
 
@@ -587,15 +594,6 @@ async def send_reminders(bot: Bot, config: Config) -> None:
             await bot.send_message(chat_id, text, reply_markup=reminder_kb(s["id"], s["site_url"]))
 
 
-async def store_chat_id(message: Message, config: Config) -> None:
-    with closing(db_connect(config.db_path)) as conn:
-        conn.execute(
-            "INSERT INTO settings(key, value) VALUES('chat_id', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (str(message.chat.id),),
-        )
-        conn.commit()
-
-
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     config = get_config()
@@ -604,7 +602,6 @@ async def main() -> None:
     bot = Bot(token=config.bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
 
-    dp.message.register(store_chat_id, CommandStart())
     dp.message.register(cmd_start, CommandStart(), flags={"config": config})
     dp.message.register(cmd_help, Command("help"))
     dp.message.register(cmd_add_provider, Command("add_provider"))
