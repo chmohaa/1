@@ -32,7 +32,11 @@ ALLOWED_PRIVATE_USER_IDS = {
     for x in os.getenv("ALLOWED_USER_IDS", DEFAULT_ALLOWED_USERS).split(",")
     if x.strip()
 }
-ALERT_CHAT_ID = int(os.getenv("ALERT_CHAT_ID", str(min(ALLOWED_PRIVATE_USER_IDS))))
+ALERT_CHAT_IDS = {
+    int(x.strip())
+    for x in os.getenv("ALERT_CHAT_IDS", os.getenv("ALERT_CHAT_ID", os.getenv("ALLOWED_USER_IDS", DEFAULT_ALLOWED_USERS))).split(",")
+    if x.strip()
+}
 
 
 @dataclass
@@ -224,7 +228,8 @@ async def notify_unauthorized_attempt(bot: Bot, user_id: int | None, username: s
         f"text: <code>{safe_text}</code>"
     )
     try:
-        await bot.send_message(ALERT_CHAT_ID, msg)
+        for alert_chat_id in ALERT_CHAT_IDS:
+            await bot.send_message(alert_chat_id, msg)
     except Exception:
         logging.exception("Failed to send unauthorized alert")
 
