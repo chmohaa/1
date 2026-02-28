@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 from html import escape
 from contextlib import closing
@@ -170,6 +171,24 @@ def reminder_kb(server_id: int, provider_url: str) -> InlineKeyboardMarkup:
     )
 
 
+def ping_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🏓 Пинг всех серверов", callback_data="chat_ping_all")],
+            [InlineKeyboardButton(text="🎯 Пинг отдельного сервера", callback_data="chat_ping_choose")],
+        ]
+    )
+
+
+def ping_servers_kb(servers: list[sqlite3.Row]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=s["name"], callback_data=f"chat_ping_one:{s['id']}")]
+            for s in servers
+        ]
+    )
+
+
 def server_credentials_keyboard(server: sqlite3.Row, provider: sqlite3.Row) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -277,9 +296,56 @@ async def ping_ip(ip: str) -> tuple[bool, str]:
     output = stdout.decode("utf-8", errors="ignore").strip()
     err = stderr.decode("utf-8", errors="ignore").strip()
     if proc.returncode == 0:
-        summary = output.splitlines()[-2:] if output else ["ok"]
-        return True, " | ".join(summary)
+        return True, output
     return False, (err or output or "unreachable")
+
+
+def parse_ping_output(raw: str) -> tuple[str, str, str]:
+    sent = "0"
+    received = "0"
+    avg = "—"
+
+    m_packets = re.search(r"(\d+)\s+packets transmitted,\s*(\d+)\s+received", raw)
+    if m_packets:
+        sent, received = m_packets.group(1), m_packets.group(2)
+
+    m_rtt = re.search(r"=\s*([\d\.]+)/([\d\.]+)/([\d\.]+)/", raw)
+    if m_rtt:
+        avg = m_rtt.group(2)
+
+    return sent, received, avg
+
+
+def format_group_ping_result(name: str, ip: str, ok: bool, raw: str) -> str:
+    sent, received, avg = parse_ping_output(raw)
+    status = "✅" if ok else "❌"
+    return (
+        f"{status} {name} ({ip})\n"
+        f"пакетов отправлено/получено {sent}/{received}\n"
+        f"пинг: {avg} мс"
+    )
+
+def split_text_chunks(text: str, limit: int = 3500) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        candidate = line if not current else f"{current}\n{line}"
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        while len(line) > limit:
+            chunks.append(line[:limit])
+            line = line[limit:]
+        current = line
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 async def cmd_start(message: Message, config: Config) -> None:
@@ -307,8 +373,7 @@ async def cmd_help(message: Message, check_access: bool = True) -> None:
     if not is_private_chat(message):
         await message.answer(
             "Этот бот в чате умеет:\n"
-            "/ping — пинг всех серверов\n"
-            "/ping_название_сервера — пинг конкретного сервера"
+            "/ping — меню пинга серверов"
         )
         return
     if check_access and not is_allowed_private_user(message):
@@ -977,63 +1042,19 @@ async def cmd_ping(message: Message, config: Config) -> None:
         await message.answer("Серверов пока нет.")
         return
 
+    if not is_private_chat(message):
+        await message.answer("Выбери режим пинга:", reply_markup=ping_menu_kb())
+        return
+
     await message.answer("Проверяю пинг серверов (ping -c 4)...")
     lines = ["Результат /ping:"]
     for srv in servers:
         ok, details = await ping_ip(srv["ip"])
         status = "✅" if ok else "❌"
         lines.append(f"{status} {srv['name']} ({srv['ip']}) — <code>{details}</code>")
-    await message.answer("\n".join(lines))
 
-
-async def cmd_ping_single(message: Message, config: Config) -> None:
-    text = (message.text or "").strip()
-    if not text.startswith("/ping_"):
-        return
-
-    raw = text[6:]
-    if "@" in raw:
-        raw = raw.split("@", 1)[0]
-    server_token = raw.strip()
-    if not server_token:
-        await message.answer("Укажи сервер: /ping_название_сервера")
-        return
-
-    if is_private_chat(message) and not is_allowed_private_user(message):
-        await message.answer("⛔ У вас нет доступа к этому боту.")
-        await notify_unauthorized_attempt(
-            message.bot,
-            message.from_user.id if message.from_user else None,
-            message.from_user.username if message.from_user else None,
-            message.from_user.full_name if message.from_user else None,
-            message.chat.id,
-            message.chat.type,
-            message.text or "",
-        )
-        return
-
-    normalized = server_token.replace("_", " ")
-    with closing(db_connect(config.db_path)) as conn:
-        server = conn.execute(
-            """
-            SELECT id, name, ip
-            FROM servers
-            WHERE name = ? OR name = ? OR REPLACE(name, ' ', '_') = ?
-            LIMIT 1
-            """,
-            (server_token, normalized, server_token),
-        ).fetchone()
-
-    if not server:
-        await message.answer(f"Сервер не найден: <code>{server_token}</code>")
-        return
-
-    await message.answer(f"Пингую {server['name']} (ping -c 4)...")
-    ok, details = await ping_ip(server["ip"])
-    status = "✅" if ok else "❌"
-    await message.answer(
-        f"{status} Пинг {server['name']} ({server['ip']}):\n<code>{details}</code>"
-    )
+    for chunk in split_text_chunks("\n".join(lines)):
+        await message.answer(chunk)
 
 
 async def callback_ping_server(callback: CallbackQuery, config: Config) -> None:
@@ -1066,6 +1087,69 @@ async def callback_ping_server(callback: CallbackQuery, config: Config) -> None:
     )
 
 
+async def callback_chat_ping_all(callback: CallbackQuery, config: Config) -> None:
+    if callback.message.chat.type == "private":
+        await callback.answer("Доступно только в чате", show_alert=True)
+        return
+
+    with closing(db_connect(config.db_path)) as conn:
+        servers = conn.execute("SELECT id, name, ip FROM servers ORDER BY name").fetchall()
+
+    if not servers:
+        await callback.answer("Серверов пока нет", show_alert=True)
+        return
+
+    await callback.answer("Пингую все серверы...")
+    await callback.message.edit_text("Пингую все серверы (ping -c 4)...")
+    lines = ["Результаты пинга:"]
+    for srv in servers:
+        ok, raw = await ping_ip(srv["ip"])
+        lines.append(format_group_ping_result(srv["name"], srv["ip"], ok, raw))
+        lines.append("")
+    await callback.message.answer("\n".join(lines).strip())
+
+
+async def callback_chat_ping_choose(callback: CallbackQuery, config: Config) -> None:
+    if callback.message.chat.type == "private":
+        await callback.answer("Доступно только в чате", show_alert=True)
+        return
+
+    with closing(db_connect(config.db_path)) as conn:
+        servers = conn.execute("SELECT id, name, ip FROM servers ORDER BY name").fetchall()
+
+    if not servers:
+        await callback.answer("Серверов пока нет", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.edit_text(
+        "Выбери сервер для пинга:",
+        reply_markup=ping_servers_kb(servers),
+    )
+
+
+async def callback_chat_ping_one(callback: CallbackQuery, config: Config) -> None:
+    if callback.message.chat.type == "private":
+        await callback.answer("Доступно только в чате", show_alert=True)
+        return
+
+    server_id = int(callback.data.split(":", 1)[1])
+    with closing(db_connect(config.db_path)) as conn:
+        server = conn.execute("SELECT id, name, ip FROM servers WHERE id=?", (server_id,)).fetchone()
+
+    if not server:
+        await callback.answer("Сервер не найден", show_alert=True)
+        return
+
+    await callback.answer("Пингую сервер...")
+    await callback.message.edit_text(
+        f"Пингую {server['name']} (ping -c 4)...",
+        reply_markup=ping_menu_kb(),
+    )
+    ok, raw = await ping_ip(server["ip"])
+    await callback.message.answer(format_group_ping_result(server["name"], server["ip"], ok, raw))
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     config = get_config()
@@ -1077,7 +1161,6 @@ async def main() -> None:
     dp.message.register(cmd_start, CommandStart(), flags={"config": config})
     dp.message.register(cmd_help, Command("help"))
     dp.message.register(cmd_ping, Command("ping"), flags={"config": config})
-    dp.message.register(cmd_ping_single, F.text.startswith("/ping_"), flags={"config": config})
     dp.message.register(cmd_add_provider, Command("add_provider"))
     dp.message.register(cmd_add_server, Command("add_new_server"))
     dp.message.register(cmd_providers, Command("providers"), flags={"config": config})
@@ -1095,6 +1178,9 @@ async def main() -> None:
     dp.callback_query.register(callback_delete_server, F.data.startswith("delete_server:"), flags={"config": config})
     dp.callback_query.register(callback_choose_provider, F.data.startswith("choose_provider:"), flags={"config": config})
     dp.callback_query.register(callback_ping_server, F.data.startswith("ping:"), flags={"config": config})
+    dp.callback_query.register(callback_chat_ping_all, F.data == "chat_ping_all", flags={"config": config})
+    dp.callback_query.register(callback_chat_ping_choose, F.data == "chat_ping_choose", flags={"config": config})
+    dp.callback_query.register(callback_chat_ping_one, F.data.startswith("chat_ping_one:"), flags={"config": config})
     dp.callback_query.register(callback_paid, F.data.startswith("paid:"))
     dp.callback_query.register(callback_adjust_balance, F.data == "adjust_balance")
     dp.callback_query.register(callbacks_router, flags={"config": config})
