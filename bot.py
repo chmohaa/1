@@ -169,6 +169,27 @@ def format_money(amount: float) -> str:
     return f"{amount:,.2f} ₽".replace(",", " ")
 
 
+def normalize_provider_url(raw: str) -> str | None:
+    value = (raw or "").strip()
+    if not value:
+        return None
+
+    if value.startswith("@") and len(value) > 1:
+        username = value[1:]
+        return f"https://t.me/{username}"
+
+    if value.startswith("t.me/"):
+        return f"https://{value}"
+
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
+
+    if "." in value and " " not in value:
+        return f"https://{value}"
+
+    return None
+
+
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -182,12 +203,11 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
 
 def reminder_kb(server_id: int, provider_url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid:{server_id}")],
-            [InlineKeyboardButton(text="🌐 Оплатить у провайдера", url=provider_url)],
-        ]
-    )
+    rows = [[InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid:{server_id}")]]
+    safe_url = normalize_provider_url(provider_url)
+    if safe_url:
+        rows.append([InlineKeyboardButton(text="🌐 Оплатить у провайдера", url=safe_url)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def should_show_paid_button(due_date_raw: str) -> bool:
@@ -222,7 +242,9 @@ def server_info_keyboard(server: sqlite3.Row, provider: sqlite3.Row) -> InlineKe
     if should_show_paid_button(server["due_date"]):
         rows.append([InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid:{server['id']}")])
     rows.append([InlineKeyboardButton(text="🏓 Пинг", callback_data=f"ping:{server['id']}")])
-    rows.append([InlineKeyboardButton(text="🌐 Сайт провайдера", url=provider["site_url"])])
+    safe_url = normalize_provider_url(provider["site_url"])
+    if safe_url:
+        rows.append([InlineKeyboardButton(text="🌐 Сайт провайдера", url=safe_url)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
