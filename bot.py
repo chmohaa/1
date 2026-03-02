@@ -146,6 +146,25 @@ def parse_date(value: str) -> date:
     return date(y, m, d)
 
 
+def add_one_month(d: date) -> date:
+    year = d.year + (1 if d.month == 12 else 0)
+    month = 1 if d.month == 12 else d.month + 1
+    day = d.day
+    while day > 28:
+        try:
+            return date(year, month, day)
+        except ValueError:
+            day -= 1
+    return date(year, month, day)
+
+
+def normalize_server_alias(value: str) -> str:
+    v = value.strip().lower().replace("_", " ").replace("-", " ")
+    v = re.sub(r"\s+", " ", v)
+    v = re.sub(r"[^\w\s]", "", v, flags=re.UNICODE)
+    return v.strip()
+
+
 def format_money(amount: float) -> str:
     return f"{amount:,.2f} ₽".replace(",", " ")
 
@@ -171,6 +190,15 @@ def reminder_kb(server_id: int, provider_url: str) -> InlineKeyboardMarkup:
     )
 
 
+def should_show_paid_button(due_date_raw: str) -> bool:
+    try:
+        due = date.fromisoformat(due_date_raw)
+    except ValueError:
+        return False
+    today = datetime.now(MOSCOW_TZ).date()
+    return due <= today + timedelta(days=3)
+
+
 def ping_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -189,13 +217,13 @@ def ping_servers_kb(servers: list[sqlite3.Row]) -> InlineKeyboardMarkup:
     )
 
 
-def server_credentials_keyboard(server: sqlite3.Row, provider: sqlite3.Row) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🏓 Пинг", callback_data=f"ping:{server['id']}")],
-            [InlineKeyboardButton(text="🌐 Сайт провайдера", url=provider["site_url"])],
-        ]
-    )
+def server_info_keyboard(server: sqlite3.Row, provider: sqlite3.Row) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if should_show_paid_button(server["due_date"]):
+        rows.append([InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid:{server['id']}")])
+    rows.append([InlineKeyboardButton(text="🏓 Пинг", callback_data=f"ping:{server['id']}")])
+    rows.append([InlineKeyboardButton(text="🌐 Сайт провайдера", url=provider["site_url"])])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def db_connect(db_path: str) -> sqlite3.Connection:
@@ -651,7 +679,7 @@ async def callback_show_server(callback: CallbackQuery, config: Config) -> None:
         f"Оплата: {format_money(server['price'])}\n"
         f"Дата окончания: {server['due_date']}"
     )
-    await callback.message.answer(text, reply_markup=server_credentials_keyboard(server, provider))
+    await callback.message.answer(text, reply_markup=server_info_keyboard(server, provider))
     await callback.answer()
 
 
@@ -758,11 +786,34 @@ async def callback_choose_provider(callback: CallbackQuery, state: FSMContext, c
 async def server_info_alias(message: Message, config: Config) -> None:
     if not await ensure_private_access(message):
         return
-    if not message.text.startswith("/server-info-"):
+    text = (message.text or "").strip()
+    if not (text.startswith("/server-info-") or text.startswith("/server-info_")):
         return
-    name = message.text.replace("/server-info-", "", 1).strip()
+    if text.startswith("/server-info-"):
+        raw_name = text.replace("/server-info-", "", 1)
+    else:
+        raw_name = text.replace("/server-info_", "", 1)
+    if "@" in raw_name:
+        raw_name = raw_name.split("@", 1)[0]
+    name = raw_name.strip()
+    normalized = name.replace("_", " ")
     with closing(db_connect(config.db_path)) as conn:
-        server = conn.execute("SELECT * FROM servers WHERE name=?", (name,)).fetchone()
+        server = conn.execute(
+            """
+            SELECT * FROM servers
+            WHERE name=? OR name=? OR REPLACE(name, ' ', '_')=?
+            LIMIT 1
+            """,
+            (name, normalized, name),
+        ).fetchone()
+        if not server:
+            # Fallback: устойчивый матч для кейсов с emoji/дефисами/подчёркиваниями
+            all_servers = conn.execute("SELECT * FROM servers").fetchall()
+            wanted = normalize_server_alias(name)
+            for row in all_servers:
+                if normalize_server_alias(row["name"]) == wanted:
+                    server = row
+                    break
         if not server:
             await message.answer("Сервер не найден")
             return
@@ -772,9 +823,11 @@ async def server_info_alias(message: Message, config: Config) -> None:
             f"Сервер: <b>{server['name']}</b>\n"
             f"Провайдер: {provider['name']}\nIP: <code>{server['ip']}</code>\n"
             f"user: <code>{server['ssh_user']}</code>\npasswd: <code>{server['ssh_password']}</code>\n"
-            f"acc user: <code>{provider['acc_user']}</code>\nacc passwd: <code>{provider['acc_password']}</code>"
+            f"acc user: <code>{provider['acc_user']}</code>\nacc passwd: <code>{provider['acc_password']}</code>\n"
+            f"Оплата: {format_money(server['price'])}\n"
+            f"Дата окончания: {server['due_date']}"
         ),
-        reply_markup=server_credentials_keyboard(server, provider),
+        reply_markup=server_info_keyboard(server, provider),
     )
 
 
@@ -789,10 +842,10 @@ async def show_upcoming(message: Message, config: Config, check_access: bool = T
             SELECT s.name, s.ip, s.price, s.due_date, p.site_url
             FROM servers s
             JOIN providers p ON p.id=s.provider_id
-            WHERE DATE(s.due_date) BETWEEN DATE(?) AND DATE(?)
+            WHERE DATE(s.due_date) <= DATE(?)
             ORDER BY s.due_date
             """,
-            (now.isoformat(), week_end.isoformat()),
+            (week_end.isoformat(),),
         ).fetchall()
     if not rows:
         await message.answer("На этой неделе оплат нет 🎉")
@@ -847,7 +900,7 @@ async def cmd_balance(message: Message, config: Config, check_access: bool = Tru
     await message.answer("\n".join(text), reply_markup=kb)
 
 
-async def callback_paid(callback: CallbackQuery, state: FSMContext) -> None:
+async def callback_paid(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
     if callback.message.chat.type != "private" or not callback.from_user or callback.from_user.id not in ALLOWED_PRIVATE_USER_IDS:
         await callback.answer("Недоступно", show_alert=True)
         await notify_unauthorized_attempt(
@@ -861,9 +914,38 @@ async def callback_paid(callback: CallbackQuery, state: FSMContext) -> None:
         )
         return
     server_id = int(callback.data.split(":", 1)[1])
-    await state.set_state(PaidDateState.waiting_date)
-    await state.update_data(paid_server_id=server_id)
-    await callback.message.answer("Введите дату оплаты/новой аренды в формате xx xx xxxx")
+    with closing(db_connect(config.db_path)) as conn:
+        server = conn.execute("SELECT id, name, price, due_date FROM servers WHERE id=?", (server_id,)).fetchone()
+        if not server:
+            await callback.answer("Сервер не найден", show_alert=True)
+            return
+
+        today = datetime.now(MOSCOW_TZ).date()
+        current_due = date.fromisoformat(server["due_date"])
+        base_date = current_due if current_due > today else today
+        new_due = add_one_month(base_date)
+
+        conn.execute("UPDATE servers SET due_date=? WHERE id=?", (new_due.isoformat(), server_id))
+        conn.execute(
+            "INSERT INTO payments(server_id, amount, paid_date, created_at, note) VALUES(?,?,?,?,?)",
+            (
+                server_id,
+                server["price"],
+                new_due.isoformat(),
+                datetime.now(MOSCOW_TZ).isoformat(),
+                "Оплачено через кнопку (автопродление на месяц)",
+            ),
+        )
+        current_balance = get_balance(conn)
+        new_balance = current_balance - float(server["price"])
+        set_balance(conn, new_balance)
+        add_transaction(conn, -float(server["price"]), f"Оплата {server['name']}")
+        conn.commit()
+
+    await state.clear()
+    await callback.message.answer(
+        f"✅ Оплата учтена: {server['name']} продлён до {new_due.isoformat()}"
+    )
     await callback.answer()
 
 
@@ -985,15 +1067,9 @@ async def callbacks_router(callback: CallbackQuery, config: Config, state: FSMCo
 
 async def send_reminders(bot: Bot, config: Config) -> None:
     now = datetime.now(MOSCOW_TZ).date()
-    target = now + timedelta(days=2)
+    target = now + timedelta(days=3)
     with closing(db_connect(config.db_path)) as conn:
-        users = []
-        # Последний пользователь, который написал /start
-        row = conn.execute("SELECT value FROM settings WHERE key='chat_id'").fetchone()
-        if row:
-            chat_id = int(row["value"])
-            if chat_id in ALLOWED_PRIVATE_USER_IDS:
-                users = [chat_id]
+        users = sorted(ALLOWED_PRIVATE_USER_IDS)
         servers = conn.execute(
             """
             SELECT s.id, s.name, s.ip, s.price, s.due_date, p.site_url
@@ -1009,6 +1085,7 @@ async def send_reminders(bot: Bot, config: Config) -> None:
 
     for chat_id in users:
         for s in servers:
+            days_left = (date.fromisoformat(s["due_date"]) - now).days
             cmd = f"/server-info-{s['name']}"
             text = (
                 "⏰ Напоминание об оплате сервера\n"
@@ -1016,9 +1093,13 @@ async def send_reminders(bot: Bot, config: Config) -> None:
                 f"IP: <code>{s['ip']}</code>\n"
                 f"К оплате: {format_money(s['price'])}\n"
                 f"Дата окончания аренды: {s['due_date']}\n"
+                f"До оплаты: {days_left} дн.\n"
                 f"Детали сервера: <code>{cmd}</code>"
             )
-            await bot.send_message(chat_id, text, reply_markup=reminder_kb(s["id"], s["site_url"]))
+            try:
+                await bot.send_message(chat_id, text, reply_markup=reminder_kb(s["id"], s["site_url"]))
+            except Exception:
+                logging.exception("Failed to send reminder to %s", chat_id)
 
 
 async def cmd_ping(message: Message, config: Config) -> None:
@@ -1171,6 +1252,7 @@ async def main() -> None:
     dp.message.register(cmd_total, Command("total"), flags={"config": config})
     dp.message.register(cmd_balance, Command("balance"), flags={"config": config})
     dp.message.register(server_info_alias, F.text.startswith("/server-info-"), flags={"config": config})
+    dp.message.register(server_info_alias, F.text.startswith("/server-info_"), flags={"config": config})
 
     dp.callback_query.register(callback_show_server, F.data.startswith("server:"), flags={"config": config})
     dp.callback_query.register(callback_show_provider, F.data.startswith("provider:"), flags={"config": config})
@@ -1181,7 +1263,7 @@ async def main() -> None:
     dp.callback_query.register(callback_chat_ping_all, F.data == "chat_ping_all", flags={"config": config})
     dp.callback_query.register(callback_chat_ping_choose, F.data == "chat_ping_choose", flags={"config": config})
     dp.callback_query.register(callback_chat_ping_one, F.data.startswith("chat_ping_one:"), flags={"config": config})
-    dp.callback_query.register(callback_paid, F.data.startswith("paid:"))
+    dp.callback_query.register(callback_paid, F.data.startswith("paid:"), flags={"config": config})
     dp.callback_query.register(callback_adjust_balance, F.data == "adjust_balance")
     dp.callback_query.register(callbacks_router, flags={"config": config})
 
@@ -1198,12 +1280,11 @@ async def main() -> None:
     dp.message.register(server_flow, AddServerStates.price, flags={"config": config})
     dp.message.register(server_flow, AddServerStates.due_date, flags={"config": config})
 
-    dp.message.register(save_paid_date, PaidDateState.waiting_date, flags={"config": config})
     dp.message.register(apply_balance_adjust, BalanceAdjustState.waiting_amount, flags={"config": config})
 
     scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
     scheduler.add_job(send_reminders, CronTrigger(hour=8, minute=0), kwargs={"bot": bot, "config": config})
-    scheduler.add_job(send_reminders, CronTrigger(hour=17, minute=0), kwargs={"bot": bot, "config": config})
+    scheduler.add_job(send_reminders, CronTrigger(hour=18, minute=0), kwargs={"bot": bot, "config": config})
     scheduler.start()
 
     await dp.start_polling(bot, config=config)
